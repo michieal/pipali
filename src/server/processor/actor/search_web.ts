@@ -464,58 +464,58 @@ export async function webSearch(args: WebSearchArgs, conversationId?: string): P
         let extendedResult: ExtendedSearchResult | null = null;
         let lastError: Error | null = null;
 
-        // Try DuckDuckGo first (no API key required)
-        try {
-            extendedResult = await searchWithDuckDuckGo(query, effectiveMaxResults);
-            if (extendedResult.organic.length > 0) {
-                log.debug(`Found ${extendedResult.organic.length} results using DuckDuckGo`);
+        // Try database-configured providers first (ordered by priority)
+        for (const provider of providers) {
+            try {
+                if (provider.type === 'serper') {
+                    extendedResult = await searchWithSerper(
+                        query,
+                        effectiveMaxResults,
+                        country_code,
+                        provider.apiKey || undefined,
+                        provider.apiBaseUrl || undefined
+                    );
+                } else if (provider.type === 'exa') {
+                    extendedResult = await searchWithExa(
+                        query,
+                        effectiveMaxResults,
+                        country_code,
+                        provider.apiKey || undefined,
+                        provider.apiBaseUrl || undefined
+                    );
+                } else if (provider.type === 'platform') {
+                    // Platform provider - uses platformFetch for automatic token refresh
+                    if (provider.apiBaseUrl) {
+                        extendedResult = await searchWithPlatform(
+                            query,
+                            effectiveMaxResults,
+                            country_code,
+                            provider.apiBaseUrl,
+                            conversationId,
+                        );
+                    }
+                }
+
+                if (extendedResult && extendedResult.organic.length > 0) {
+                    log.debug(`Found ${extendedResult.organic.length} results using ${provider.name}`);
+                    break;
+                }
+            } catch (error) {
+                lastError = error instanceof Error ? error : new Error(String(error));
+                log.warn(`Failed with ${provider.name}: ${lastError.message}`);
             }
-        } catch (error) {
-            lastError = error instanceof Error ? error : new Error(String(error));
-            log.warn(`DuckDuckGo search failed: ${lastError.message}`);
         }
 
-        // Try database-configured providers first (ordered by priority)
+        // Try DuckDuckGo before paid environment-variable fallbacks.
         if (!extendedResult || extendedResult.organic.length === 0) {
-            for (const provider of providers) {
-                try {
-                    if (provider.type === 'serper') {
-                        extendedResult = await searchWithSerper(
-                            query,
-                            effectiveMaxResults,
-                            country_code,
-                            provider.apiKey || undefined,
-                            provider.apiBaseUrl || undefined
-                        );
-                    } else if (provider.type === 'exa') {
-                        extendedResult = await searchWithExa(
-                            query,
-                            effectiveMaxResults,
-                            country_code,
-                            provider.apiKey || undefined,
-                            provider.apiBaseUrl || undefined
-                        );
-                    } else if (provider.type === 'platform') {
-                        // Platform provider - uses platformFetch for automatic token refresh
-                        if (provider.apiBaseUrl) {
-                            extendedResult = await searchWithPlatform(
-                                query,
-                                effectiveMaxResults,
-                                country_code,
-                                provider.apiBaseUrl,
-                                conversationId,
-                            );
-                        }
-                    }
-
-                    if (extendedResult && extendedResult.organic.length > 0) {
-                        log.debug(`Found ${extendedResult.organic.length} results using ${provider.name}`);
-                        break;
-                    }
-                } catch (error) {
-                    lastError = error instanceof Error ? error : new Error(String(error));
-                    log.warn(`Failed with ${provider.name}: ${lastError.message}`);
+            try {
+                extendedResult = await searchWithDuckDuckGo(query, effectiveMaxResults);
+                if (extendedResult.organic.length > 0) {
+                    log.debug(`Found ${extendedResult.organic.length} results using DuckDuckGo`);
                 }
+            } catch (error) {
+                lastError = error instanceof Error ? error : new Error(String(error));
+                log.warn(`DuckDuckGo search failed: ${lastError.message}`);
             }
         }
 
