@@ -354,6 +354,89 @@ async function searchWithExa(
 }
 
 /**
+ * Search using DuckDuckGo HTML search (no API key required)
+ */
+async function searchWithDuckDuckGo(
+    query: string,
+    maxResults: number,
+): Promise<ExtendedSearchResult> {
+    const searchEndpoint = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+
+    log.debug(`Searching DuckDuckGo for: "${query.slice(0, 100)}${query.length > 100 ? '...' : ''}"`);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), SEARCH_REQUEST_TIMEOUT);
+
+    try {
+        const response = await fetch(searchEndpoint, {
+            method: 'GET',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+            },
+            signal: controller.signal,
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`DuckDuckGo search failed: ${response.status} - ${errorText}`);
+        }
+
+        const html = await response.text();
+        const organic: SearchResult[] = [];
+
+        // DuckDuckGo's HTML endpoint returns each organic result in a .result block.
+        const resultBlocks = html.match(/<div[^>]+class=["'][^"']*\bresult\b[^"']*["'][^>]*>[\s\S]*?<\/div>\s*<\/div>/gi) || [];
+
+        const decodeHtml = (value: string): string => value
+            .replace(/<[^>]+>/g, '')
+            .replace(/&amp;/gi, '&')
+            .replace(/&quot;/gi, '"')
+            .replace(/&#39;/gi, "'")
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&nbsp;/gi, ' ')
+            .trim();
+
+        for (const block of resultBlocks) {
+            if (organic.length >= maxResults) break;
+
+            const linkMatch = block.match(/<a[^>]+class=["'][^"']*\bresult__a\b[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>/i);
+            const titleMatch = block.match(/<a[^>]+class=["'][^"']*\bresult__a\b[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
+            const snippetMatch = block.match(/<[^>]+class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)<\/[^>]+>/i);
+
+            if (!linkMatch || !titleMatch) continue;
+
+            let link = linkMatch[1];
+            try {
+                const parsed = new URL(link, 'https://duckduckgo.com');
+                const redirected = parsed.searchParams.get('uddg');
+                if (redirected) link = decodeURIComponent(redirected);
+            } catch {
+                // Keep the original link if it isn't a valid URL.
+            }
+
+            const title = decodeHtml(titleMatch[1]);
+            const snippet = snippetMatch ? decodeHtml(snippetMatch[1]) : '';
+
+            if (title && link) {
+                organic.push({ title, link, snippet });
+            }
+        }
+
+        return { organic };
+    } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            throw new Error('Search request timed out');
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+/**
  * Main web search function
  */
 export async function webSearch(args: WebSearchArgs, conversationId?: string): Promise<WebSearchResult> {
@@ -381,45 +464,58 @@ export async function webSearch(args: WebSearchArgs, conversationId?: string): P
         let extendedResult: ExtendedSearchResult | null = null;
         let lastError: Error | null = null;
 
+        // Try DuckDuckGo first (no API key required)
+        try {
+            extendedResult = await searchWithDuckDuckGo(query, effectiveMaxResults);
+            if (extendedResult.organic.length > 0) {
+                log.debug(`Found ${extendedResult.organic.length} results using DuckDuckGo`);
+            }
+        } catch (error) {
+            lastError = error instanceof Error ? error : new Error(String(error));
+            log.warn(`DuckDuckGo search failed: ${lastError.message}`);
+        }
+
         // Try database-configured providers first (ordered by priority)
-        for (const provider of providers) {
-            try {
-                if (provider.type === 'serper') {
-                    extendedResult = await searchWithSerper(
-                        query,
-                        effectiveMaxResults,
-                        country_code,
-                        provider.apiKey || undefined,
-                        provider.apiBaseUrl || undefined
-                    );
-                } else if (provider.type === 'exa') {
-                    extendedResult = await searchWithExa(
-                        query,
-                        effectiveMaxResults,
-                        country_code,
-                        provider.apiKey || undefined,
-                        provider.apiBaseUrl || undefined
-                    );
-                } else if (provider.type === 'platform') {
-                    // Platform provider - uses platformFetch for automatic token refresh
-                    if (provider.apiBaseUrl) {
-                        extendedResult = await searchWithPlatform(
+        if (!extendedResult || extendedResult.organic.length === 0) {
+            for (const provider of providers) {
+                try {
+                    if (provider.type === 'serper') {
+                        extendedResult = await searchWithSerper(
                             query,
                             effectiveMaxResults,
                             country_code,
-                            provider.apiBaseUrl,
-                            conversationId,
+                            provider.apiKey || undefined,
+                            provider.apiBaseUrl || undefined
                         );
+                    } else if (provider.type === 'exa') {
+                        extendedResult = await searchWithExa(
+                            query,
+                            effectiveMaxResults,
+                            country_code,
+                            provider.apiKey || undefined,
+                            provider.apiBaseUrl || undefined
+                        );
+                    } else if (provider.type === 'platform') {
+                        // Platform provider - uses platformFetch for automatic token refresh
+                        if (provider.apiBaseUrl) {
+                            extendedResult = await searchWithPlatform(
+                                query,
+                                effectiveMaxResults,
+                                country_code,
+                                provider.apiBaseUrl,
+                                conversationId,
+                            );
+                        }
                     }
-                }
 
-                if (extendedResult && extendedResult.organic.length > 0) {
-                    log.debug(`Found ${extendedResult.organic.length} results using ${provider.name}`);
-                    break;
+                    if (extendedResult && extendedResult.organic.length > 0) {
+                        log.debug(`Found ${extendedResult.organic.length} results using ${provider.name}`);
+                        break;
+                    }
+                } catch (error) {
+                    lastError = error instanceof Error ? error : new Error(String(error));
+                    log.warn(`Failed with ${provider.name}: ${lastError.message}`);
                 }
-            } catch (error) {
-                lastError = error instanceof Error ? error : new Error(String(error));
-                log.warn(`Failed with ${provider.name}: ${lastError.message}`);
             }
         }
 
