@@ -163,6 +163,8 @@ const App = () => {
     const defaultModelRef = useRef<ChatModelInfo | null>(null);
     // Track isConnected for callbacks that may close over stale state
     const isConnectedRef = useRef(false);
+    // Distinguishes the first connect from a reconnect
+    const hasConnectedRef = useRef(false);
     // When on home page, observe active conversations so confirmations and live state
     // (e.g., needs_input) can appear without opening the conversation.
     const observedActiveConversationsRef = useRef<Set<string>>(new Set());
@@ -695,6 +697,18 @@ const App = () => {
         observe(conversationId);
     }, [conversationId, isConnected, observe]);
 
+    // A dropped connection misses every event published while it was down, and the bus replays
+    // nothing once the run it belonged to has finished. Re-read persisted state on reconnect.
+    useEffect(() => {
+        if (!isConnected) return;
+        const isReconnect = hasConnectedRef.current;
+        hasConnectedRef.current = true;
+        if (!isReconnect) return; // the first connect is covered by the fetches on mount
+
+        fetchConversations();
+        if (conversationIdRef.current) void fetchHistory(conversationIdRef.current);
+    }, [isConnected]);
+
     useEffect(() => {
         if (!isConnected) return;
         if (currentPage !== 'home') return;
@@ -960,6 +974,25 @@ const App = () => {
             };
 
             for (const msg of data.history) {
+                // Memories recalled for this turn - render collapsed, like compaction.
+                // Blockquoted so bold lines inside memory bodies don't read as new thought headings.
+                if (msg.source === 'system' && msg.extra?.kind === 'memory_recall') {
+                    const recalled = typeof msg.message === 'string' ? msg.message : JSON.stringify(msg.message);
+                    const count = Array.isArray(msg.extra?.memory_paths) ? msg.extra.memory_paths.length : 0;
+                    const quoted = recalled
+                        .replace(/^# Memory recalled\n/, '')
+                        .split('\n')
+                        .map((line: string) => line ? `> ${line}` : '>')
+                        .join('\n');
+                    thoughts.push({
+                        type: 'thought',
+                        content: `**${t('thoughts.recalledMemories', { count })}**\n${quoted}`,
+                        id: generateDeterministicId('memory-recall', recalled),
+                        isInternalThought: true,
+                    });
+                    continue;
+                }
+
                 if (msg.source === 'user') {
                     // Check if this is a compaction step - render as thought instead of user message
                     if (msg.extra?.is_compaction === true) {

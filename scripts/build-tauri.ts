@@ -607,6 +607,208 @@ async function installPatchedGtkPlugin() {
 }
 
 /**
+ * Enforce the AppImage bundle/host boundary at repack.
+ *
+ * AppRun prepends AppDir/usr/lib to LD_LIBRARY_PATH for the whole process
+ * tree, so a bundled library shadows the host's copy — including for host
+ * libraries loaded later into the same process. Anything coupled to the
+ * kernel driver, GPU or compositor therefore has to come from the host:
+ * bundling it freezes it at the build host's version (ubuntu-22.04) and
+ * breaks on every distro that has moved on. khoj-ai/pipali#21 is exactly
+ * that — host Mesa's libEGL binds the bundled wayland 1.20 libwayland-client
+ * instead of the host's, misses symbols current Mesa needs, and no EGL
+ * display can be created, so WebKitWebProcess aborts into a blank window.
+ *
+ * scripts/linux/appimage-excludelist.txt is the canonical list of libraries
+ * on the host's side of that line. linuxdeploy applies it too, but bakes it
+ * into its binary at its own build time, and Tauri serves linuxdeploy from a
+ * static, unversioned tag on its own mirror - the same URL in every Tauri
+ * version, last refreshed 2024-07-29, while libwayland-client was excluded
+ * upstream on 2024-11-03. No Tauri upgrade moves that list for us.
+ *
+ * So rather than strip the escapee by name and wait for the next one to be
+ * reported as a bug, classify every excludelist library that reaches the
+ * AppDir: strip it, or record why we ship it anyway. An unclassified one
+ * fails the build, so a linuxdeploy or WebKitGTK bump cannot quietly change
+ * what we ship, and checkExcludelistDrift covers entries added upstream
+ * after our own snapshot.
+ */
+
+/** Where scripts/linux/appimage-excludelist.txt is vendored from. */
+const EXCLUDELIST_UPSTREAM_URL =
+    "https://raw.githubusercontent.com/AppImageCommunity/pkg2appimage/master/excludelist";
+
+/** Excludelist libraries deleted from the AppDir so the host's copy wins. */
+const STRIP_FROM_BUNDLE: Record<string, string> = {
+    "libwayland-client.so": "host Mesa's libEGL binds this SONAME and needs symbols the build host's 1.20 copy lacks (#21)",
+};
+
+/**
+ * Excludelist libraries we ship anyway, with the reason the excludelist's
+ * rationale does not apply to us. Empty today: libwayland-client is the only
+ * excludelist entry that reaches the AppDir.
+ */
+const KEEP_BUNDLED: Record<string, string> = {};
+
+/** "libwayland-client.so.0.20.0" -> "libwayland-client.so"; null if not a shared library. */
+function sharedLibraryStem(fileName: string): string | null {
+    return /^(.+\.so)(?:\.\d+)*$/.exec(fileName)?.[1] ?? null;
+}
+
+function parseExcludelistStems(raw: string): Set<string> {
+    const stems = new Set<string>();
+    for (const line of raw.split("\n")) {
+        const entry = line.trim();
+        if (!entry || entry.startsWith("#")) continue;
+        const stem = sharedLibraryStem(entry);
+        if (stem) stems.add(stem);
+    }
+    return stems;
+}
+
+async function loadExcludelistStems(): Promise<Set<string>> {
+    const listPath = path.join(ROOT_DIR, "scripts", "linux", "appimage-excludelist.txt");
+    const stems = parseExcludelistStems(await Bun.file(listPath).text());
+    if (stems.size === 0) throw new Error(`No entries parsed from ${listPath}`);
+    return stems;
+}
+
+/**
+ * Fail the build when upstream has excluded a library we are still bundling.
+ *
+ * The vendored snapshot decides what gets stripped, so the artifact stays
+ * reproducible and offline builds keep working. Upstream is consulted only to
+ * answer the question the snapshot cannot: is our copy behind in a way that
+ * matters? A newly excluded library that is not in our bundle is a note to
+ * refresh the file; one that IS in our bundle is khoj-ai/pipali#21 happening
+ * again, so it stops the build. A fetch that does not land says nothing about
+ * us and is logged, not fatal.
+ */
+async function checkExcludelistDrift(bundled: Set<string>, vendored: Set<string>) {
+    let upstream: Set<string>;
+    try {
+        const resp = await fetch(EXCLUDELIST_UPSTREAM_URL, { signal: AbortSignal.timeout(15_000) });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        upstream = parseExcludelistStems(await resp.text());
+        if (upstream.size === 0) throw new Error("no entries parsed");
+    } catch (err) {
+        console.log(`   ⚠️  Could not compare the excludelist against upstream: ${err}`);
+        return;
+    }
+
+    const added = [...upstream].filter((stem) => !vendored.has(stem)).sort();
+    if (added.length === 0) return;
+
+    console.log(`   Vendored excludelist is behind upstream: ${added.join(", ")}`);
+    const bundledAndNew = added.filter((stem) => bundled.has(stem));
+    if (bundledAndNew.length > 0) {
+        throw new Error(
+            `Upstream excludes ${bundledAndNew.join(", ")}, which this AppDir still bundles. ` +
+            "Refresh scripts/linux/appimage-excludelist.txt and classify them in " +
+            "STRIP_FROM_BUNDLE or KEEP_BUNDLED in scripts/build-tauri.ts.",
+        );
+    }
+    console.log("   None of them are in this bundle; refresh the file when convenient");
+}
+
+async function enforceAppImageExcludelist(extractRoot: string) {
+    const excluded = await loadExcludelistStems();
+    const bundled = new Set<string>();
+    const stripped: string[] = [];
+    const kept = new Set<string>();
+    const unclassified = new Set<string>();
+
+    async function walk(dir: string) {
+        const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => null);
+        if (!entries) return; // layout-dependent: usr/lib64 may not exist
+        for (const entry of entries) {
+            const entryPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                // usr/lib/Pipali holds the app's own resources, never linuxdeploy's libs
+                if (entry.name === "Pipali") continue;
+                await walk(entryPath);
+                continue;
+            }
+            const stem = sharedLibraryStem(entry.name);
+            if (!stem) continue;
+            bundled.add(stem);
+            if (!excluded.has(stem)) continue;
+            if (KEEP_BUNDLED[stem]) {
+                kept.add(stem);
+            } else if (STRIP_FROM_BUNDLE[stem]) {
+                await fs.rm(entryPath, { force: true });
+                stripped.push(path.relative(extractRoot, entryPath));
+            } else {
+                unclassified.add(stem);
+            }
+        }
+    }
+
+    await walk(path.join(extractRoot, "usr", "lib"));
+    await walk(path.join(extractRoot, "usr", "lib64"));
+
+    for (const lib of stripped) {
+        console.log(`   Stripped ${lib} — ${STRIP_FROM_BUNDLE[sharedLibraryStem(path.basename(lib))!]}`);
+    }
+    for (const stem of kept) console.log(`   Kept bundled ${stem} — ${KEEP_BUNDLED[stem]}`);
+    if (stripped.length === 0) console.log("   No excludelist libraries to strip");
+
+    if (unclassified.size > 0) {
+        throw new Error(
+            `AppDir bundles unclassified excludelist libraries: ${[...unclassified].sort().join(", ")}. ` +
+            "Add each to STRIP_FROM_BUNDLE or KEEP_BUNDLED in scripts/build-tauri.ts.",
+        );
+    }
+
+    await checkExcludelistDrift(bundled, excluded);
+}
+
+/** 
+ * Replace the bundled xdg-open with a hand-off to the host's own xdg-open.
+ *
+ * Tauri's bundler copies /usr/bin/xdg-open from the CI build host into the
+ * AppImage when the opener API is enabled (tauri-apps/tauri#4265), and AppRun
+ * puts AppDir/usr/bin first on PATH, so every "open in browser" in the app
+ * (Tauri opener plugin, the auth flows' Bun.spawn('xdg-open'), MCP OAuth)
+ * runs that ubuntu-22.04 copy inside the AppImage's runtime environment.
+ * Two things go wrong (khoj-ai/pipali#52):
+ * - xdg-utils 1.1.x predates Plasma 6: with KDE_SESSION_VERSION=6 its KDE
+ *   branch matches no case and reports success without launching anything,
+ *   so "Continue with Google" waits forever.
+ * - Whatever xdg-open launches inherits the AppImage's LD_LIBRARY_PATH, GTK
+ *   theme/backend and module caches: host helpers crash on the bundled
+ *   libraries (kde-open, gio: symbol lookup errors) and the browser gets the
+ *   bundled GTK setup.
+ * scripts/appimage/xdg-open strips the AppImage additions from the
+ * environment and execs the host's xdg-open, keeping the build host's copy
+ * (renamed xdg-open.bundled) only as a fallback for hosts without xdg-utils.
+ */
+async function installHostXdgOpenHandoff(extractRoot: string) {
+    const binDir = path.join(extractRoot, "usr", "bin");
+    const xdgOpen = path.join(binDir, "xdg-open");
+    const bundledFallback = path.join(binDir, "xdg-open.bundled");
+
+    const hasBundled = await fs
+        .access(xdgOpen)
+        .then(() => true)
+        .catch(() => false);
+    if (hasBundled) {
+        await fs.rename(xdgOpen, bundledFallback);
+    }
+    await fs.copyFile(path.join(ROOT_DIR, "scripts", "appimage", "xdg-open"), xdgOpen);
+    await fs.chmod(xdgOpen, 0o755);
+
+    // A hand-off that does not even parse would silently break every browser
+    // open in the AppImage; catch that at build time.
+    const checkProc = Bun.spawn(["sh", "-n", xdgOpen], { stdout: "ignore", stderr: "inherit" });
+    if ((await checkProc.exited) !== 0) throw new Error("Installed xdg-open hand-off failed to parse");
+
+    console.log(
+        `   Installed host xdg-open hand-off${hasBundled ? " (build-host copy kept as usr/bin/xdg-open.bundled)" : ""}`,
+    );
+}
+
+/**
  * Repack the produced AppImage with pristine sidecar binaries (bun, uv, uvx).
  *
  * Even with the GTK plugin patch above keeping linuxdeploy from crashing, the
@@ -688,6 +890,9 @@ async function repackAppImageWithPristineSidecars(debug: boolean, platform: Plat
         await fs.chmod(dst, 0o755);
         console.log(`   Restored pristine ${name}`);
     }
+
+    await installHostXdgOpenHandoff(extractRoot);
+    await enforceAppImageExcludelist(extractRoot);
 
     // Without this verify step the build could regress to silently shipping a
     // corrupted bun again — the original symptom only surfaces at app launch.
