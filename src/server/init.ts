@@ -71,6 +71,53 @@ async function listOpenAICompatibleModels(apiKey: string, apiBaseUrl?: string): 
     }
 }
 
+let localModelRefreshInProgress = false;
+
+/**
+ * Refresh models from locally hosted OpenAI-compatible providers.
+ *
+ * Local providers are stored in AiModelApi, so this works even when the
+ * provider configuration was not supplied through the sidecar environment.
+ */
+export async function refreshLocalModels(): Promise<void> {
+    if (localModelRefreshInProgress) return;
+    localModelRefreshInProgress = true;
+
+    try {
+        const providers = await db.select().from(AiModelApi);
+
+        for (const provider of providers) {
+            if (!provider.apiBaseUrl) continue;
+
+            let url: URL;
+            try {
+                url = new URL(provider.apiBaseUrl);
+            } catch {
+                continue;
+            }
+
+            const hostname = url.hostname.toLowerCase();
+            if (!['127.0.0.1', 'localhost', '::1'].includes(hostname)) continue;
+
+            const models = await listOpenAICompatibleModels(provider.apiKey ?? 'ollama', provider.apiBaseUrl);
+            if (models) {
+                await setupChatModelProvider(
+                    provider.name,
+                    'openai',
+                    provider.apiKey ?? 'ollama',
+                    models,
+                    true,
+                    provider.apiBaseUrl,
+                );
+            }
+        }
+    } catch (err) {
+        log.warn({ err: (err as Error).message }, 'Failed to refresh local models');
+    } finally {
+        localModelRefreshInProgress = false;
+    }
+}
+
 export async function initializeDatabase() {
     // 1. Create default local user (used to associate all local state in the embedded DB)
     const defaultUserEmail = getDefaultUser().email;
@@ -110,6 +157,17 @@ export async function initializeDatabase() {
     if (process.env.ANTHROPIC_API_KEY) {
         await setupChatModelProvider('Anthropic', 'anthropic', process.env.ANTHROPIC_API_KEY, defaultAnthropicModels, true);
     }
+
+    // Refresh models from locally configured OpenAI-compatible providers as well.
+    // These providers may be stored in the database without corresponding sidecar
+    // environment variables, which is common for desktop/local Ollama setups.
+    await refreshLocalModels();
+
+    // Keep the local model list current while the app is running.
+    const localModelRefreshTimer = setInterval(() => {
+        void refreshLocalModels();
+    }, 5_000);
+    localModelRefreshTimer.unref?.();
 
     // 3. Setup default MCP servers
     await setupDefaultMcpServers();
