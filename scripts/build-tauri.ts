@@ -12,7 +12,7 @@
  * - Python scripts to use bundled UV (no manual install)
  * - Offline-capable document creation
  *
- * Usage: bun run scripts/build-tauri.ts [--platform=<platform>] [--debug] [--no-updater-artifacts]
+ * Usage: bun run scripts/build-tauri.ts [--platform=<platform>] [--debug] [--no-updater-artifacts] [--no-sign]
  *
  * Platforms:
  *   - darwin-arm64 (macOS Apple Silicon)
@@ -69,7 +69,7 @@ async function parseArgs(): Promise<{ platform: Platform; debug: boolean; disabl
         if (arg === "--debug") {
             debug = true;
         }
-        if (arg === "--no-updater-artifacts") {
+        if (arg === "--no-updater-artifacts" || arg === "--no-sign") {
             disableUpdaterArtifacts = true;
         }
     }
@@ -142,7 +142,10 @@ async function downloadBunRuntime(platform: Platform): Promise<string> {
     }
 
     // Extract using unzip
+    // Remove any previous extraction so unzip never prompts about replacing
+    // an existing Bun binary on repeated builds.
     const extractDir = path.join(tempDir, "extracted");
+    await fs.rm(extractDir, { recursive: true, force: true });
     await fs.mkdir(extractDir, { recursive: true });
 
     const unzipProc = Bun.spawn(["unzip", "-q", zipPath, "-d", extractDir], {
@@ -150,7 +153,10 @@ async function downloadBunRuntime(platform: Platform): Promise<string> {
         stdout: "inherit",
         stderr: "inherit",
     });
-    await unzipProc.exited;
+    const unzipExitCode = await unzipProc.exited;
+    if (unzipExitCode !== 0) {
+        throw new Error(`Failed to extract Bun archive: unzip exited with code ${unzipExitCode}`);
+    }
 
     // Find the bun binary in the extracted directory
     const bunBinaryName = isWindows ? "bun.exe" : "bun";
@@ -579,6 +585,241 @@ async function cleanupTemp() {
     await fs.rm(path.join(DIST_DIR, "_temp_uv"), { recursive: true, force: true });
 }
 
+async function ensureAppImageTool(platform: Platform): Promise<string> {
+    const arch = APPIMAGETOOL_ARCH[platform];
+
+    if (!arch) {
+        throw new Error(`No appimagetool arch mapping for ${platform}`);
+    }
+
+    const cacheDir = path.join(
+        process.env.HOME || "/root",
+        ".cache",
+        "tauri",
+    );
+
+    await fs.mkdir(cacheDir, { recursive: true });
+
+    const appimagetool = path.join(
+        cacheDir,
+        `appimagetool-${APPIMAGETOOL_VERSION}-${arch}.AppImage`,
+    );
+
+    try {
+        await fs.access(appimagetool);
+        console.log(`   Using cached appimagetool: ${appimagetool}`);
+        return appimagetool;
+    } catch {
+        // Not cached; download it.
+    }
+
+    const url =
+    `https://github.com/AppImage/appimagetool/releases/download/` +
+    `${APPIMAGETOOL_VERSION}/appimagetool-${arch}.AppImage`;
+
+    console.log(`   Downloading appimagetool from ${url}`);
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+        throw new Error(
+            `Failed to download appimagetool: HTTP ${response.status}`,
+        );
+    }
+
+    const tempPath = `${appimagetool}.download`;
+
+    try {
+        const downloadData = await response.arrayBuffer();
+            if (downloadData.byteLength === 0) {
+                throw new Error("Downloaded response was empty");
+            }
+            await fs.writeFile(tempPath, new Uint8Array(downloadData));
+        await fs.chmod(tempPath, 0o755);
+        await fs.rename(tempPath, appimagetool);
+    } catch (err) {
+        await fs.rm(tempPath, { force: true });
+        throw err;
+    }
+
+    // Make absolutely sure we actually got the executable.
+    const stat = await fs.stat(appimagetool);
+
+    if (stat.size === 0) {
+        await fs.rm(appimagetool, { force: true });
+        throw new Error("Downloaded appimagetool is empty");
+    }
+
+    console.log(
+        `   ✅ Downloaded appimagetool (${Math.round(stat.size / 1024)} KiB)`,
+    );
+
+    return appimagetool;
+}
+
+/**
+ * Patch Tauri's cached linuxdeploy AppImage to use the host's modern GNU strip.
+ *
+ * Tauri currently supplies a linuxdeploy build containing GNU Binutils 2.35.
+ * Modern EndeavourOS/Arch libraries can contain ELF SHT_RELR (.relr.dyn)
+ * sections, which Binutils 2.35 cannot process. The host's current strip
+ * handles these correctly.
+ *
+ * The linuxdeploy AppImage carries its own statically-linked strip, so
+ * changing PATH is insufficient. We therefore extract linuxdeploy, replace
+ * its bundled strip with the host strip, verify it, and repack it.
+ */
+async function installPatchedLinuxdeploy() {
+    if (!process.platform.startsWith("linux")) return;
+
+    const cacheDir = path.join(process.env.HOME || "/root", ".cache", "tauri");
+    await fs.mkdir(cacheDir, { recursive: true });
+
+    const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
+    const linuxdeploy = path.join(cacheDir, `linuxdeploy-${arch}.AppImage`);
+
+    try {
+        await fs.access(linuxdeploy);
+    } catch {
+        // Tauri has not downloaded linuxdeploy yet. It will do so during
+        // `tauri build`, so there is nothing for us to patch at this point.
+        console.log("   linuxdeploy not cached yet; Tauri will download it during the build");
+        return;
+    }
+
+    const hostStrip = "/usr/bin/strip";
+
+    try {
+        await fs.access(hostStrip);
+    } catch {
+        throw new Error(`Host GNU strip not found at ${hostStrip}`);
+    }
+
+    const versionProc = Bun.spawn([hostStrip, "--version"], {
+        stdout: "pipe",
+        stderr: "pipe",
+    });
+    const hostStripVersion = (await new Response(versionProc.stdout).text()).split("\n")[0].trim();
+
+    if ((await versionProc.exited) !== 0) {
+        throw new Error(`Unable to execute host strip at ${hostStrip}`);
+    }
+
+    console.log(`🔧 Patching cached linuxdeploy with ${hostStripVersion}...`);
+
+    const patchRoot = await fs.mkdtemp(path.join(cacheDir, "linuxdeploy-patch-"));
+    const extractRoot = path.join(patchRoot, "squashfs-root");
+    const patchedAppImage = path.join(patchRoot, path.basename(linuxdeploy));
+
+    try {
+        const extractProc = Bun.spawn(
+            [linuxdeploy, "--appimage-extract"],
+            {
+                cwd: patchRoot,
+                stdout: "ignore",
+                stderr: "inherit",
+            },
+        );
+
+        if ((await extractProc.exited) !== 0) {
+            throw new Error("Failed to extract cached linuxdeploy AppImage");
+        }
+
+        const bundledStrip = path.join(extractRoot, "usr", "bin", "strip");
+
+        try {
+            await fs.access(bundledStrip);
+        } catch {
+            throw new Error(`linuxdeploy bundled strip not found at ${bundledStrip}`);
+        }
+
+        const oldStripProc = Bun.spawn([bundledStrip, "--version"], {
+            stdout: "pipe",
+            stderr: "pipe",
+        });
+        const oldStripVersion = (await new Response(oldStripProc.stdout).text()).split("\n")[0].trim();
+
+        if ((await oldStripProc.exited) !== 0) {
+            throw new Error(`Unable to execute linuxdeploy bundled strip at ${bundledStrip}`);
+        }
+
+        console.log(`   linuxdeploy bundled strip: ${oldStripVersion}`);
+        console.log(`   Replacing with host strip: ${hostStripVersion}`);
+
+        await fs.copyFile(hostStrip, bundledStrip);
+        await fs.chmod(bundledStrip, 0o755);
+
+        const verifyProc = Bun.spawn([bundledStrip, "--version"], {
+            stdout: "pipe",
+            stderr: "pipe",
+        });
+        const verifyVersion = (await new Response(verifyProc.stdout).text()).split("\n")[0].trim();
+
+        if ((await verifyProc.exited) !== 0) {
+            throw new Error("Patched linuxdeploy strip failed verification");
+        }
+
+        if (verifyVersion !== hostStripVersion) {
+            throw new Error(
+                `Patched linuxdeploy strip version mismatch: expected "${hostStripVersion}", got "${verifyVersion}"`,
+            );
+        }
+
+        console.log(`   ✓ Verified linuxdeploy strip: ${verifyVersion}`);
+
+        const appimagetool = await ensureAppImageTool(
+            arch === "aarch64" ? "linux-arm64" : "linux-x64",
+        );
+
+        const repackProc = Bun.spawn(
+            [appimagetool, "--appimage-extract-and-run", extractRoot, patchedAppImage],
+            {
+                cwd: patchRoot,
+                env: {
+                    ...process.env,
+                    ARCH: arch,
+                },
+                stdout: "inherit",
+                stderr: "inherit",
+            },
+        );
+
+        if ((await repackProc.exited) !== 0) {
+            throw new Error("Failed to repack patched linuxdeploy AppImage");
+        }
+
+        await fs.chmod(patchedAppImage, 0o755);
+
+        // Verify the repacked AppImage itself before replacing Tauri's copy.
+        const verifyAppImageProc = Bun.spawn(
+            [patchedAppImage, "--appimage-extract-and-run", "--version"],
+            {
+                stdout: "pipe",
+                stderr: "pipe",
+            },
+        );
+
+        const verifyAppImageOut =
+        (await new Response(verifyAppImageProc.stdout).text()).trim();
+
+        if ((await verifyAppImageProc.exited) !== 0) {
+            throw new Error(
+                "Patched linuxdeploy AppImage failed its self-test",
+            );
+        }
+
+        console.log(`   ✓ Verified patched linuxdeploy: ${verifyAppImageOut}`);
+
+        // Replace the cached Tauri copy only after every verification passed.
+        await fs.rename(patchedAppImage, linuxdeploy);
+
+        console.log("✅ Patched cached linuxdeploy to use modern host GNU strip");
+    } finally {
+        await fs.rm(patchRoot, { recursive: true, force: true });
+    }
+    console.log("✅ Patched cached linuxdeploy to use modern host GNU strip");
+}
+
 /**
  * Pre-stage a patched linuxdeploy-plugin-gtk.sh in Tauri's tools cache.
  *
@@ -868,7 +1109,11 @@ async function repackAppImageWithPristineSidecars(debug: boolean, platform: Plat
         console.log(`   Downloading appimagetool from ${url}`);
         const resp = await fetch(url);
         if (!resp.ok) throw new Error(`Failed to download appimagetool: HTTP ${resp.status}`);
-        await Bun.write(appimagetool, resp);
+        const data = await resp.arrayBuffer();
+            if (data.byteLength === 0) {
+                throw new Error("Downloaded appimagetool response was empty");
+            }
+            await fs.writeFile(appimagetool, new Uint8Array(data));
         await fs.chmod(appimagetool, 0o755);
     }
 
@@ -973,6 +1218,7 @@ async function buildTauri(debug: boolean, platform: Platform, disableUpdaterArti
     }
 
     if (platform.startsWith("linux")) {
+        await installPatchedLinuxdeploy();
         await installPatchedGtkPlugin();
     }
 
