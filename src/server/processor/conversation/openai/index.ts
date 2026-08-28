@@ -34,22 +34,39 @@ export async function sendMessageToGpt(
         ...(runId && { run_id: runId }),
     };
 
-    // Use streaming to avoid timeout issues
-    const stream = client.responses.stream({
+    const request = {
         model: model,
         input: messages,
         tools: openaiTools,
         tool_choice: openaiTools ? toolChoice as Responses.ToolChoiceOptions : undefined,
         ...(Object.keys(tracer).length > 0 && { metadata: tracer }),
-    });
+    };
 
-    if (onTextChunk) {
-        stream.on('response.output_text.delta', (event) => {
-            onTextChunk(event.delta);
-        });
+    // Use streaming to avoid timeout issues. If the OpenAI response stream
+    // cannot be accumulated because the response contains a missing content
+    // index, retry the exact same request without streaming. This can happen
+    // when a new conversation has no usable content/history yet.
+    let response: Responses.Response;
+    try {
+        const stream = client.responses.stream(request);
+
+        if (onTextChunk) {
+            stream.on('response.output_text.delta', (event) => {
+                onTextChunk(event.delta);
+            });
+        }
+
+        response = await stream.finalResponse();
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+
+        if (!message.includes('missing content at index')) {
+            throw error;
+        }
+
+        log.warn({ err: error }, 'OpenAI response stream reported missing content; retrying without streaming');
+        response = await client.responses.create(request);
     }
-
-    const response = await stream.finalResponse();
 
     if (!response) {
         throw new Error('No response received from model');
